@@ -8,15 +8,14 @@ import json
 import time
 
 # ----------------- ENVIRONMENT VARIABLES -----------------
-# Strictly loaded from environment variables (configured on Railway / server)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID_ENV = os.getenv("OWNER_ID")
 
 if not BOT_TOKEN:
-    sys.exit("[CRITICAL ERROR] 'BOT_TOKEN' environment variable is missing! Please configure it in your Railway dashboard.")
+    sys.exit("[CRITICAL ERROR] 'BOT_TOKEN' environment variable is missing! Please configure it in Railway.")
 
 if not OWNER_ID_ENV:
-    sys.exit("[CRITICAL ERROR] 'OWNER_ID' environment variable is missing! Please configure it in your Railway dashboard.")
+    sys.exit("[CRITICAL ERROR] 'OWNER_ID' environment variable is missing! Please configure it in Railway.")
 
 try:
     OWNER_ID = int(OWNER_ID_ENV)
@@ -27,6 +26,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 
 USERS_FILE = "allowed_users.json"
 CONFIG_FILE = "bot_config.json"
+MAX_CHANNELS = 10
 
 current_dir = os.getcwd()
 bg_processes = {}
@@ -51,16 +51,35 @@ def save_users(users_set):
         json.dump(list(users_set), f)
 
 def load_config():
-    default_config = {
-        "required_channel_id": None,
-        "required_channel_title": None,
-        "required_channel_username": None,
-        "required_channel_invite_link": None
+    """
+    Format of bot_config.json:
+    {
+        "required_channels": [
+            {
+                "id": -100123456789,
+                "title": "Channel Name",
+                "username": "channel_username",
+                "invite_link": "https://t.me/..."
+            }
+        ]
     }
+    """
+    default_config = {"required_channels": []}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                return {**default_config, **json.load(f)}
+                data = json.load(f)
+                # Backward compatibility with single-channel format
+                if "required_channel_id" in data and data["required_channel_id"]:
+                    data["required_channels"] = [{
+                        "id": data["required_channel_id"],
+                        "title": data.get("required_channel_title") or "Required Channel",
+                        "username": data.get("required_channel_username"),
+                        "invite_link": data.get("required_channel_invite_link")
+                    }]
+                if "required_channels" not in data:
+                    data["required_channels"] = []
+                return data
         except Exception:
             return default_config
     return default_config
@@ -80,32 +99,42 @@ def is_owner(user_id):
 def is_allowed_user(user_id):
     return user_id in allowed_users or user_id == OWNER_ID
 
-def check_channel_subscription(user_id):
+def check_channel_subscriptions(user_id):
     """
-    Checks if a user is subscribed to the configured channel.
-    Returns: (is_member: bool, invite_link: str or None)
+    Checks if a user is subscribed to ALL configured channels (up to 10).
+    Returns: (is_all_joined: bool, missing_channels: list of dicts)
     """
     if is_owner(user_id):
-        return True, None
+        return True, []
 
-    channel_id = bot_config.get("required_channel_id")
-    if not channel_id:
-        return True, None
+    channels = bot_config.get("required_channels", [])
+    if not channels:
+        return True, []
 
-    try:
-        member = bot.get_chat_member(channel_id, user_id)
-        if member.status in ['member', 'administrator', 'creator']:
-            return True, None
-        else:
-            return False, bot_config.get("required_channel_invite_link")
-    except Exception as e:
-        print(f"[!] Channel subscription check error: {e}")
-        return False, bot_config.get("required_channel_invite_link")
+    missing = []
+    for ch in channels:
+        ch_id = ch.get("id")
+        try:
+            member = bot.get_chat_member(ch_id, user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                missing.append(ch)
+        except Exception as e:
+            print(f"[!] Error checking channel {ch_id}: {e}")
+            missing.append(ch)
 
-def get_join_keyboard(invite_link=None):
+    return (len(missing) == 0), missing
+
+def get_join_channels_keyboard(missing_channels):
+    """
+    Builds keyboard with invite links for all unjoined channels
+    plus a Verify Membership button.
+    """
     markup = types.InlineKeyboardMarkup(row_width=1)
-    if invite_link:
-        markup.add(types.InlineKeyboardButton("📢 Join Channel", url=invite_link))
+    for i, ch in enumerate(missing_channels, 1):
+        link = ch.get("invite_link")
+        title = ch.get("title", f"Channel {i}")
+        if link:
+            markup.add(types.InlineKeyboardButton(f"📢 Join {title}", url=link))
     markup.add(types.InlineKeyboardButton("🔄 Verify Membership", callback_data="verify_membership"))
     return markup
 
@@ -136,7 +165,7 @@ def get_main_menu_keyboard(user_id):
 
     # Owner specific controls
     if is_owner(user_id):
-        btn_channel = types.InlineKeyboardButton("📢 Channel Settings", callback_data="btn_channel_info")
+        btn_channel = types.InlineKeyboardButton("📢 Channel Manager", callback_data="btn_channel_info")
         btn_users = types.InlineKeyboardButton("👥 Users List", callback_data="btn_list_users")
         markup.add(btn_channel, btn_users)
 
@@ -149,7 +178,8 @@ def get_back_keyboard():
     return markup
 
 def get_help_text():
-    channel_status = bot_config.get("required_channel_title") or "None"
+    channels = bot_config.get("required_channels", [])
+    count = len(channels)
     return f"""⚡️ *DEV X HOST | NEON TERMINAL* ⚡️
 *═════════════════════════*
 Welcome to the core system. You have full terminal access. 🚀
@@ -178,15 +208,16 @@ Welcome to the core system. You have full terminal access. 🚀
 🔑 *ACCESS & CONTROL:*
 ▪️ `/myid` - View your Telegram User ID 🪪
 ▪️ `/menu` or `/start` - Interactive Dashboard 🎛
-▪️ `/channel` - Configure required channel *(Owner only)* 📢
-▪️ `/channel_del` - Remove required channel *(Owner only)* ❌
-▪️ `/add <id>` & `/remove <id>` - Whitelist access *(Owner only)* 👥
+▪️ `/channel` - Add channel via forward *(Max 10)* 📢
+▪️ `/channels` - View & remove channels *(Owner only)* 📋
+▪️ `/channel_del <id>` - Remove specific channel ❌
+▪️ `/add <id>` & `/remove <id>` - Whitelist access 👥
 
-🔒 *Required Channel:* `{channel_status}`
+🔒 *Active Channels:* `{count} / {MAX_CHANNELS}`
 *═════════════════════════*
 *SYSTEM READY >_* Type a command or use the buttons below:"""
 
-# ----------------- OWNER COMMANDS -----------------
+# ----------------- OWNER CHANNEL MANAGEMENT -----------------
 
 @bot.message_handler(commands=['channel'])
 def set_channel_prompt(message):
@@ -194,27 +225,72 @@ def set_channel_prompt(message):
         bot.reply_to(message, "💀 *[ACCESS DENIED]* Privilege escalation failed. Owner only.", parse_mode="Markdown")
         return
     
+    current_count = len(bot_config.get("required_channels", []))
+    if current_count >= MAX_CHANNELS:
+        bot.reply_to(
+            message,
+            f"⚠️ *[LIMIT REACHED]* You already have `{MAX_CHANNELS}` channels added!\n"
+            f"Use `/channels` or `/channel_del <id>` to remove one first.",
+            parse_mode="Markdown"
+        )
+        return
+
     waiting_for_channel_forward.add(message.from_user.id)
     text = (
-        "📢 *[CHANNEL SETUP MODE]*\n\n"
-        "1. Make sure you add this bot as an **Administrator** in your channel with invite link permissions.\n"
-        "2. **Forward any post/message from that channel to this chat right now.**\n\n"
-        "Send `/cancel` at any time to cancel."
+        f"📢 *[CHANNEL SETUP MODE]* ({current_count}/{MAX_CHANNELS} active)\n\n"
+        f"1. Make sure you add this bot as an **Administrator** in your channel with invite link permissions.\n"
+        f"2. **Forward any post/message from that channel to this chat right now.**\n\n"
+        f"Send `/cancel` at any time to cancel."
     )
     markup = types.InlineKeyboardMarkup()
     markup.add(types.InlineKeyboardButton("❌ Cancel Setup", callback_data="cancel_channel_setup"))
     bot.reply_to(message, text, parse_mode="Markdown", reply_markup=markup)
 
+@bot.message_handler(commands=['channels'])
+def list_channels_cmd(message):
+    if not is_owner(message.from_user.id): return
+    show_channel_manager(message.chat.id, None)
+
 @bot.message_handler(commands=['channel_del'])
-def delete_channel_config(message):
-    if not is_owner(message.from_user.id):
+def delete_channel_by_arg(message):
+    if not is_owner(message.from_user.id): return
+    args = message.text.split(" ")
+    if len(args) < 2:
+        bot.reply_to(message, "⚠️ *Format Error:*\nUse `/channel_del <channel_id>` or `/channels` to manage with buttons.", parse_mode="Markdown")
         return
-    bot_config["required_channel_id"] = None
-    bot_config["required_channel_title"] = None
-    bot_config["required_channel_username"] = None
-    bot_config["required_channel_invite_link"] = None
-    save_config(bot_config)
-    bot.reply_to(message, "✅ *[CHANNEL REMOVED]* Subscription requirement has been disabled.", parse_mode="Markdown")
+    try:
+        del_id = int(args[1])
+        channels = bot_config.get("required_channels", [])
+        before = len(channels)
+        bot_config["required_channels"] = [c for c in channels if c.get("id") != del_id]
+        if len(bot_config["required_channels"]) < before:
+            save_config(bot_config)
+            bot.reply_to(message, f"✅ Removed channel `{del_id}`.", parse_mode="Markdown")
+        else:
+            bot.reply_to(message, f"❌ Channel ID `{del_id}` not found in list.", parse_mode="Markdown")
+    except ValueError:
+        bot.reply_to(message, "⚠️ Channel ID must be a numeric integer.")
+
+def show_channel_manager(chat_id, message_id=None):
+    channels = bot_config.get("required_channels", [])
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    if not channels:
+        text = "📢 *[CHANNEL MANAGER]*\n\nNo required channels configured yet (0/10).\nSend `/channel` to add one!"
+    else:
+        text = f"📢 *[CHANNEL MANAGER]* ({len(channels)}/{MAX_CHANNELS} Active)\n\n"
+        for i, ch in enumerate(channels, 1):
+            text += f"{i}. *{ch.get('title')}*\n   ID: `{ch.get('id')}`\n   Link: {ch.get('invite_link') or 'None'}\n\n"
+            markup.add(types.InlineKeyboardButton(f"🗑 Remove: {ch.get('title')[:25]}", callback_data=f"del_ch_{ch.get('id')}"))
+
+    if len(channels) < MAX_CHANNELS:
+        markup.add(types.InlineKeyboardButton("➕ Add New Channel", callback_data="add_new_channel_btn"))
+    markup.add(types.InlineKeyboardButton("🔙 Back to Main Menu", callback_data="btn_main_menu"))
+
+    if message_id:
+        bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=markup)
 
 @bot.message_handler(commands=['cancel'])
 def cancel_action(message):
@@ -241,8 +317,7 @@ def add_user(message):
 
 @bot.message_handler(commands=['remove'])
 def remove_user(message):
-    if not is_owner(message.from_user.id):
-        return
+    if not is_owner(message.from_user.id): return
     try:
         del_id = int(message.text.split(" ")[1])
         if del_id == OWNER_ID:
@@ -257,7 +332,7 @@ def remove_user(message):
     except Exception:
         bot.reply_to(message, "⚠️ *Format Error:*\nUse: `/remove <userid>`", parse_mode="Markdown")
 
-# ----------------- CHANNEL FORWARD CAPTURE -----------------
+# ----------------- CHANNEL FORWARD CAPTURE (UP TO 10) -----------------
 
 @bot.message_handler(func=lambda msg: msg.from_user.id in waiting_for_channel_forward and msg.forward_from_chat is not None)
 def handle_channel_forward(message):
@@ -269,9 +344,19 @@ def handle_channel_forward(message):
         bot.reply_to(message, "❌ The forwarded message must be from a **Channel**. Setup cancelled.", parse_mode="Markdown")
         return
 
+    channels = bot_config.get("required_channels", [])
+    if len(channels) >= MAX_CHANNELS:
+        bot.reply_to(message, f"⚠️ Maximum limit of {MAX_CHANNELS} channels reached. Remove one first using `/channels`.", parse_mode="Markdown")
+        return
+
     channel_id = chat.id
     channel_title = chat.title or "Required Channel"
     channel_username = chat.username
+
+    # Check if already in list
+    if any(c.get("id") == channel_id for c in channels):
+        bot.reply_to(message, f"⚠️ Channel *{channel_title}* (`{channel_id}`) is already in your required list!", parse_mode="Markdown")
+        return
 
     invite_link = None
     try:
@@ -288,18 +373,23 @@ def handle_channel_forward(message):
             invite_link = f"https://t.me/{channel_username}"
         print(f"[!] Could not create or fetch invite link: {e}")
 
-    bot_config["required_channel_id"] = channel_id
-    bot_config["required_channel_title"] = channel_title
-    bot_config["required_channel_username"] = channel_username
-    bot_config["required_channel_invite_link"] = invite_link
+    new_channel = {
+        "id": channel_id,
+        "title": channel_title,
+        "username": channel_username,
+        "invite_link": invite_link
+    }
+    channels.append(new_channel)
+    bot_config["required_channels"] = channels
     save_config(bot_config)
 
     success_text = (
-        f"✅ *[CHANNEL CONFIGURED SUCCESSFULLY]*\n\n"
+        f"✅ *[CHANNEL #{len(channels)} ADDED SUCCESSFULLY]*\n\n"
         f"📌 *Title:* {channel_title}\n"
         f"🆔 *Channel ID:* `{channel_id}`\n"
         f"🔗 *Link:* {invite_link or 'No link generated'}\n\n"
-        f"Users must now join this channel before requesting terminal access!"
+        f"Total Active Channels: `{len(channels)}/{MAX_CHANNELS}`\n"
+        f"Users must now join all active channels before accessing the bot!"
     )
     bot.reply_to(message, success_text, parse_mode="Markdown")
 
@@ -309,30 +399,29 @@ def handle_channel_forward(message):
 def send_menu(message):
     user_id = message.from_user.id
 
-    # If owner, direct access
     if is_owner(user_id):
         text = get_help_text()
         bot.reply_to(message, text, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(user_id))
         return
 
-    # Check Channel Membership first
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
+    # Check All Channel Memberships
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
         bot.reply_to(
             message,
-            "⚠️ *[MEMBERSHIP REQUIRED]*\nYou must join our official channel to access this bot.",
+            f"⚠️ *[MEMBERSHIP REQUIRED]*\nYou must join all `{len(missing)}` pending channel(s) below to access this terminal.",
             parse_mode="Markdown",
-            reply_markup=get_join_keyboard(invite_link)
+            reply_markup=get_join_channels_keyboard(missing)
         )
         return
 
-    # If member of channel, check if admin approved / whitelisted
+    # If all joined, check Whitelist Authorization
     if not is_allowed_user(user_id):
         markup = types.InlineKeyboardMarkup()
         markup.add(types.InlineKeyboardButton("📩 Request Authorization from Admin", callback_data="send_auth_request"))
         bot.reply_to(
             message,
-            "✅ *[CHANNEL VERIFIED]*\nYou are a member of the required channel.\n\n"
+            "✅ *[CHANNELS VERIFIED]*\nYou are a member of all required channels.\n\n"
             "🔒 *[AUTHORIZATION REQUIRED]*\nYour account is not whitelisted by the Admin yet.\n"
             "Click below to send an authorization request to the Admin.",
             parse_mode="Markdown",
@@ -355,9 +444,9 @@ def server_status(message):
     if not is_allowed_user(user_id):
         bot.reply_to(message, "⛔️ *[UNAUTHORIZED]* Access restricted.", parse_mode="Markdown")
         return
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
-        bot.reply_to(message, "⚠️ *Access Denied:* Please join our channel.", reply_markup=get_join_keyboard(invite_link), parse_mode="Markdown")
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
+        bot.reply_to(message, "⚠️ *Access Denied:* Please join all channels.", reply_markup=get_join_channels_keyboard(missing), parse_mode="Markdown")
         return
 
     uptime = get_uptime()
@@ -374,9 +463,9 @@ def sys_info(message):
     if not is_allowed_user(user_id):
         bot.reply_to(message, "⛔️ *[UNAUTHORIZED]* Access restricted.", parse_mode="Markdown")
         return
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
-        bot.reply_to(message, "⚠️ *Access Denied:* Please join our channel.", reply_markup=get_join_keyboard(invite_link), parse_mode="Markdown")
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
+        bot.reply_to(message, "⚠️ *Access Denied:* Please join all channels.", reply_markup=get_join_channels_keyboard(missing), parse_mode="Markdown")
         return
 
     if message.text == '/memory':
@@ -396,9 +485,9 @@ def run_bg(message):
     if not is_allowed_user(user_id):
         bot.reply_to(message, "⛔️ *[UNAUTHORIZED]* Access restricted.", parse_mode="Markdown")
         return
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
-        bot.reply_to(message, "⚠️ *Access Denied:* Please join our channel.", reply_markup=get_join_keyboard(invite_link), parse_mode="Markdown")
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
+        bot.reply_to(message, "⚠️ *Access Denied:* Please join all channels.", reply_markup=get_join_channels_keyboard(missing), parse_mode="Markdown")
         return
 
     global current_dir
@@ -420,9 +509,9 @@ def list_ps(message):
     if not is_allowed_user(user_id):
         bot.reply_to(message, "⛔️ *[UNAUTHORIZED]* Access restricted.", parse_mode="Markdown")
         return
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
-        bot.reply_to(message, "⚠️ *Access Denied:* Please join our channel.", reply_markup=get_join_keyboard(invite_link), parse_mode="Markdown")
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
+        bot.reply_to(message, "⚠️ *Access Denied:* Please join all channels.", reply_markup=get_join_channels_keyboard(missing), parse_mode="Markdown")
         return
 
     if not bg_processes:
@@ -452,9 +541,9 @@ def stop_ps(message):
     if not is_allowed_user(user_id):
         bot.reply_to(message, "⛔️ *[UNAUTHORIZED]* Access restricted.", parse_mode="Markdown")
         return
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
-        bot.reply_to(message, "⚠️ *Access Denied:* Please join our channel.", reply_markup=get_join_keyboard(invite_link), parse_mode="Markdown")
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
+        bot.reply_to(message, "⚠️ *Access Denied:* Please join all channels.", reply_markup=get_join_channels_keyboard(missing), parse_mode="Markdown")
         return
 
     try:
@@ -476,9 +565,9 @@ def download_file(message):
     if not is_allowed_user(user_id):
         bot.reply_to(message, "⛔️ *[UNAUTHORIZED]* Access restricted.", parse_mode="Markdown")
         return
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
-        bot.reply_to(message, "⚠️ *Access Denied:* Please join our channel.", reply_markup=get_join_keyboard(invite_link), parse_mode="Markdown")
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
+        bot.reply_to(message, "⚠️ *Access Denied:* Please join all channels.", reply_markup=get_join_channels_keyboard(missing), parse_mode="Markdown")
         return
 
     global current_dir
@@ -504,9 +593,9 @@ def handle_upload(message):
     if not is_allowed_user(user_id):
         bot.reply_to(message, "⛔️ *[UNAUTHORIZED]* Access restricted.", parse_mode="Markdown")
         return
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
-        bot.reply_to(message, "⚠️ *Access Denied:* Please join our channel.", reply_markup=get_join_keyboard(invite_link), parse_mode="Markdown")
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
+        bot.reply_to(message, "⚠️ *Access Denied:* Please join all channels.", reply_markup=get_join_channels_keyboard(missing), parse_mode="Markdown")
         return
 
     global current_dir
@@ -528,9 +617,9 @@ def direct_terminal(message):
     if not is_allowed_user(user_id):
         bot.reply_to(message, "⛔️ *[UNAUTHORIZED]* Access restricted.", parse_mode="Markdown")
         return
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
-        bot.reply_to(message, "⚠️ *Access Denied:* Please join our channel.", reply_markup=get_join_keyboard(invite_link), parse_mode="Markdown")
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
+        bot.reply_to(message, "⚠️ *Access Denied:* Please join all channels.", reply_markup=get_join_channels_keyboard(missing), parse_mode="Markdown")
         return
 
     global current_dir
@@ -572,10 +661,10 @@ def direct_terminal(message):
 def handle_callbacks(call):
     user_id = call.from_user.id
 
-    # 1. Verification of Channel Subscription
+    # 1. Verification of Channel Subscriptions
     if call.data == "verify_membership":
-        is_member, invite_link = check_channel_subscription(user_id)
-        if is_member:
+        is_all_joined, missing = check_channel_subscriptions(user_id)
+        if is_all_joined:
             if is_allowed_user(user_id):
                 bot.answer_callback_query(call.id, "✅ Verified! Welcome back.")
                 bot.edit_message_text(
@@ -586,14 +675,15 @@ def handle_callbacks(call):
                     reply_markup=get_main_menu_keyboard(user_id)
                 )
             else:
-                bot.answer_callback_query(call.id, "✅ Channel membership verified!")
+                bot.answer_callback_query(call.id, "✅ All channels verified!")
                 markup = types.InlineKeyboardMarkup()
                 markup.add(types.InlineKeyboardButton("📩 Request Authorization from Admin", callback_data="send_auth_request"))
+                channels_count = len(bot_config.get("required_channels", []))
                 text = (
-                    "🎉 *[CHANNEL VERIFICATION SUCCESS]*\n\n"
-                    "You have successfully joined the official channel! 🚀\n\n"
-                    "⚠️ *Next Step:* Terminal access requires Administrator approval.\n"
-                    "Click below to send an authorization request to the Admin."
+                    f"🎉 *[CHANNELS VERIFICATION SUCCESS]*\n\n"
+                    f"You have successfully joined all `{channels_count}` official channel(s)! 🚀\n\n"
+                    f"⚠️ *Next Step:* Terminal access requires Administrator approval.\n"
+                    f"Click below to send an authorization request to the Admin."
                 )
                 bot.edit_message_text(
                     chat_id=call.message.chat.id,
@@ -603,14 +693,19 @@ def handle_callbacks(call):
                     reply_markup=markup
                 )
         else:
-            bot.answer_callback_query(call.id, "❌ Not joined yet! Please join the channel first.", show_alert=True)
+            bot.answer_callback_query(call.id, f"❌ You still have {len(missing)} channel(s) left to join!", show_alert=True)
+            bot.edit_message_reply_markup(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                reply_markup=get_join_channels_keyboard(missing)
+            )
         return
 
     # 2. User Sends Auth Request to Admin
     if call.data == "send_auth_request":
-        is_member, invite_link = check_channel_subscription(user_id)
-        if not is_member:
-            bot.answer_callback_query(call.id, "❌ You must join the channel first!", show_alert=True)
+        is_all_joined, missing = check_channel_subscriptions(user_id)
+        if not is_all_joined:
+            bot.answer_callback_query(call.id, "❌ You must join all channels first!", show_alert=True)
             return
 
         if is_allowed_user(user_id):
@@ -632,12 +727,13 @@ def handle_callbacks(call):
         btn_deny = types.InlineKeyboardButton("❌ Deny Access", callback_data=f"auth_deny_{user_id}")
         admin_markup.add(btn_allow, btn_deny)
 
+        channels_count = len(bot_config.get("required_channels", []))
         admin_text = (
             f"🔔 *[NEW ACCESS REQUEST]*\n\n"
             f"👤 *Name:* {user_full_name}\n"
             f"🔗 *Username:* {user_mention}\n"
             f"🆔 *User ID:* `{user_id}`\n"
-            f"📢 *Channel Status:* Verified Member ✅\n\n"
+            f"📢 *Channels Status:* Verified Member of all `{channels_count}` channels ✅\n\n"
             f"Would you like to grant terminal access to this user?"
         )
 
@@ -706,13 +802,49 @@ def handle_callbacks(call):
             pass
         return
 
-    # 5. Check authorization for remaining commands
+    # Channel Manager Actions
+    if call.data == "btn_channel_info":
+        if not is_owner(user_id): return
+        show_channel_manager(call.message.chat.id, call.message.message_id)
+        bot.answer_callback_query(call.id)
+        return
+
+    if call.data == "add_new_channel_btn":
+        if not is_owner(user_id): return
+        current_count = len(bot_config.get("required_channels", []))
+        if current_count >= MAX_CHANNELS:
+            bot.answer_callback_query(call.id, f"Limit reached ({MAX_CHANNELS} channels maximum).", show_alert=True)
+            return
+        waiting_for_channel_forward.add(user_id)
+        text = (
+            f"📢 *[ADD CHANNEL]* ({current_count}/{MAX_CHANNELS})\n\n"
+            f"Make sure bot is admin in the channel.\n"
+            f"Now **forward any message from that channel** here.\n\n"
+            f"Send `/cancel` to cancel."
+        )
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_channel_setup"))
+        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id, text=text, parse_mode="Markdown", reply_markup=markup)
+        bot.answer_callback_query(call.id)
+        return
+
+    if call.data.startswith("del_ch_"):
+        if not is_owner(user_id): return
+        target_ch_id = int(call.data.replace("del_ch_", ""))
+        channels = bot_config.get("required_channels", [])
+        bot_config["required_channels"] = [c for c in channels if c.get("id") != target_ch_id]
+        save_config(bot_config)
+        bot.answer_callback_query(call.id, "Channel removed!")
+        show_channel_manager(call.message.chat.id, call.message.message_id)
+        return
+
+    # Check authorization for other controls
     if not is_allowed_user(user_id):
         bot.answer_callback_query(call.id, "⛔ Access denied. Unauthorized.", show_alert=True)
         return
 
-    is_member, invite_link = check_channel_subscription(user_id)
-    if not is_member:
+    is_all_joined, missing = check_channel_subscriptions(user_id)
+    if not is_all_joined:
         bot.answer_callback_query(call.id, "⚠️ Channel membership required!", show_alert=True)
         return
 
@@ -847,28 +979,6 @@ def handle_callbacks(call):
             text=get_help_text(),
             parse_mode="Markdown",
             reply_markup=get_main_menu_keyboard(user_id)
-        )
-        bot.answer_callback_query(call.id)
-
-    elif call.data == "btn_channel_info":
-        if not is_owner(user_id): return
-        ch_title = bot_config.get("required_channel_title") or "None"
-        ch_id = bot_config.get("required_channel_id") or "None"
-        ch_link = bot_config.get("required_channel_invite_link") or "None"
-        text = (
-            f"📢 *[CHANNEL VERIFICATION CONFIG]*\n\n"
-            f"📌 *Channel:* {ch_title}\n"
-            f"🆔 *ID:* `{ch_id}`\n"
-            f"🔗 *Link:* {ch_link}\n\n"
-            f"• Send `/channel` to link a new channel via forward.\n"
-            f"• Send `/channel_del` to disable verification."
-        )
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=get_back_keyboard()
         )
         bot.answer_callback_query(call.id)
 
