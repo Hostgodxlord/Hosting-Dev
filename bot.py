@@ -35,6 +35,20 @@ pending_requests = set()             # User IDs with active approval request sen
 
 START_TIME = time.time()
 
+# ----------------- ESCAPE / SANITIZATION HELPERS -----------------
+
+def escape_markdown(text):
+    """
+    Escapes Telegram legacy Markdown special characters (*, _, `, [).
+    Prevents 'can't parse entities' errors when usernames or names contain symbols.
+    """
+    if not text:
+        return ""
+    chars = ['*', '_', '`', '[']
+    for ch in chars:
+        text = text.replace(ch, f"\\{ch}")
+    return text
+
 # ----------------- STORAGE HELPERS -----------------
 
 def load_users():
@@ -51,25 +65,11 @@ def save_users(users_set):
         json.dump(list(users_set), f)
 
 def load_config():
-    """
-    Format of bot_config.json:
-    {
-        "required_channels": [
-            {
-                "id": -100123456789,
-                "title": "Channel Name",
-                "username": "channel_username",
-                "invite_link": "https://t.me/..."
-            }
-        ]
-    }
-    """
     default_config = {"required_channels": []}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
                 data = json.load(f)
-                # Backward compatibility with single-channel format
                 if "required_channel_id" in data and data["required_channel_id"]:
                     data["required_channels"] = [{
                         "id": data["required_channel_id"],
@@ -125,10 +125,6 @@ def check_channel_subscriptions(user_id):
     return (len(missing) == 0), missing
 
 def get_join_channels_keyboard(missing_channels):
-    """
-    Builds keyboard with invite links for all unjoined channels
-    plus a Verify Membership button.
-    """
     markup = types.InlineKeyboardMarkup(row_width=1)
     for i, ch in enumerate(missing_channels, 1):
         link = ch.get("invite_link")
@@ -163,7 +159,6 @@ def get_main_menu_keyboard(user_id):
     markup.add(btn_ram, btn_disk)
     markup.add(btn_ps, btn_myid)
 
-    # Owner specific controls
     if is_owner(user_id):
         btn_channel = types.InlineKeyboardButton("📢 Channel Manager", callback_data="btn_channel_info")
         btn_users = types.InlineKeyboardButton("👥 Users List", callback_data="btn_list_users")
@@ -280,8 +275,9 @@ def show_channel_manager(chat_id, message_id=None):
     else:
         text = f"📢 *[CHANNEL MANAGER]* ({len(channels)}/{MAX_CHANNELS} Active)\n\n"
         for i, ch in enumerate(channels, 1):
-            text += f"{i}. *{ch.get('title')}*\n   ID: `{ch.get('id')}`\n   Link: {ch.get('invite_link') or 'None'}\n\n"
-            markup.add(types.InlineKeyboardButton(f"🗑 Remove: {ch.get('title')[:25]}", callback_data=f"del_ch_{ch.get('id')}"))
+            clean_title = escape_markdown(ch.get('title', 'Channel'))
+            text += f"{i}. *{clean_title}*\n   ID: `{ch.get('id')}`\n   Link: {ch.get('invite_link') or 'None'}\n\n"
+            markup.add(types.InlineKeyboardButton(f"🗑 Remove: {ch.get('title', 'Channel')[:25]}", callback_data=f"del_ch_{ch.get('id')}"))
 
     if len(channels) < MAX_CHANNELS:
         markup.add(types.InlineKeyboardButton("➕ Add New Channel", callback_data="add_new_channel_btn"))
@@ -353,9 +349,8 @@ def handle_channel_forward(message):
     channel_title = chat.title or "Required Channel"
     channel_username = chat.username
 
-    # Check if already in list
     if any(c.get("id") == channel_id for c in channels):
-        bot.reply_to(message, f"⚠️ Channel *{channel_title}* (`{channel_id}`) is already in your required list!", parse_mode="Markdown")
+        bot.reply_to(message, f"⚠️ Channel *{escape_markdown(channel_title)}* (`{channel_id}`) is already in your required list!", parse_mode="Markdown")
         return
 
     invite_link = None
@@ -383,9 +378,10 @@ def handle_channel_forward(message):
     bot_config["required_channels"] = channels
     save_config(bot_config)
 
+    clean_title = escape_markdown(channel_title)
     success_text = (
         f"✅ *[CHANNEL #{len(channels)} ADDED SUCCESSFULLY]*\n\n"
-        f"📌 *Title:* {channel_title}\n"
+        f"📌 *Title:* {clean_title}\n"
         f"🆔 *Channel ID:* `{channel_id}`\n"
         f"🔗 *Link:* {invite_link or 'No link generated'}\n\n"
         f"Total Active Channels: `{len(channels)}/{MAX_CHANNELS}`\n"
@@ -701,7 +697,7 @@ def handle_callbacks(call):
             )
         return
 
-    # 2. User Sends Auth Request to Admin
+    # 2. User Sends Auth Request to Admin (FIXED: Escaped characters & fallback)
     if call.data == "send_auth_request":
         is_all_joined, missing = check_channel_subscriptions(user_id)
         if not is_all_joined:
@@ -719,8 +715,14 @@ def handle_callbacks(call):
             )
             return
 
-        user_full_name = f"{call.from_user.first_name} {call.from_user.last_name or ''}".strip()
-        user_mention = f"@{call.from_user.username}" if call.from_user.username else "No username"
+        # Sanitize names to prevent Markdown parse error (byte offset issue)
+        raw_full_name = f"{call.from_user.first_name} {call.from_user.last_name or ''}".strip()
+        safe_full_name = escape_markdown(raw_full_name)
+        
+        if call.from_user.username:
+            safe_username = "@" + escape_markdown(call.from_user.username)
+        else:
+            safe_username = "None"
 
         admin_markup = types.InlineKeyboardMarkup(row_width=2)
         btn_allow = types.InlineKeyboardButton("✅ Allow Access", callback_data=f"auth_allow_{user_id}")
@@ -730,8 +732,8 @@ def handle_callbacks(call):
         channels_count = len(bot_config.get("required_channels", []))
         admin_text = (
             f"🔔 *[NEW ACCESS REQUEST]*\n\n"
-            f"👤 *Name:* {user_full_name}\n"
-            f"🔗 *Username:* {user_mention}\n"
+            f"👤 *Name:* {safe_full_name}\n"
+            f"🔗 *Username:* {safe_username}\n"
             f"🆔 *User ID:* `{user_id}`\n"
             f"📢 *Channels Status:* Verified Member of all `{channels_count}` channels ✅\n\n"
             f"Would you like to grant terminal access to this user?"
@@ -748,7 +750,27 @@ def handle_callbacks(call):
                 parse_mode="Markdown"
             )
         except Exception as e:
-            bot.answer_callback_query(call.id, f"Error reaching Admin: {e}", show_alert=True)
+            # Fallback to plain text if Markdown still encounters formatting conflicts
+            try:
+                plain_text = (
+                    f"🔔 [NEW ACCESS REQUEST]\n\n"
+                    f"Name: {raw_full_name}\n"
+                    f"Username: @{call.from_user.username if call.from_user.username else 'None'}\n"
+                    f"User ID: {user_id}\n"
+                    f"Channels Status: Verified Member of all {channels_count} channels\n\n"
+                    f"Would you like to grant terminal access to this user?"
+                )
+                bot.send_message(OWNER_ID, plain_text, reply_markup=admin_markup)
+                pending_requests.add(user_id)
+                bot.answer_callback_query(call.id, "📨 Request sent to Admin!")
+                bot.edit_message_text(
+                    chat_id=call.message.chat.id,
+                    message_id=call.message.message_id,
+                    text="⏳ *[REQUEST TRANSMITTED]*\n\nYour authorization request has been sent to the System Admin.\nYou will receive a notification as soon as it is approved! 🚀",
+                    parse_mode="Markdown"
+                )
+            except Exception as e2:
+                bot.answer_callback_query(call.id, f"Error reaching Admin: {e2}", show_alert=True)
         return
 
     # 3. Admin Decision: ALLOW
@@ -762,12 +784,15 @@ def handle_callbacks(call):
         pending_requests.discard(target_uid)
 
         bot.answer_callback_query(call.id, f"User {target_uid} approved!")
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=call.message.text + f"\n\n🟢 *DECISION:* Allowed by Admin on {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            parse_mode="Markdown"
-        )
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=call.message.text + f"\n\n🟢 DECISION: Allowed by Admin on {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        except Exception:
+            pass
+
         try:
             user_markup = types.InlineKeyboardMarkup()
             user_markup.add(types.InlineKeyboardButton("🚀 Launch Terminal Dashboard", callback_data="btn_main_menu"))
@@ -790,12 +815,15 @@ def handle_callbacks(call):
         pending_requests.discard(target_uid)
 
         bot.answer_callback_query(call.id, f"User {target_uid} denied.")
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=call.message.text + f"\n\n🔴 *DECISION:* Denied by Admin on {time.strftime('%Y-%m-%d %H:%M:%S')}",
-            parse_mode="Markdown"
-        )
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=call.message.text + f"\n\n🔴 DECISION: Denied by Admin on {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        except Exception:
+            pass
+
         try:
             bot.send_message(target_uid, "🚫 *[ACCESS DENIED]*\nThe System Admin has rejected your authorization request.", parse_mode="Markdown")
         except Exception:
